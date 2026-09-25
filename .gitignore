@@ -1,0 +1,7 @@
+*.o
+*.exe
+rtp_sender
+rtp_receiver
+statsservice/statsservice
+sdp/*.sdp
+testdata/received.yuv

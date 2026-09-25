@@ -50,6 +50,17 @@ cd statsservice && go build -o statsservice .
 On a machine without pkg-config entries for FFmpeg, point `FFMPEG_DEV`
 at the SDK root instead: `make FFMPEG_DEV=/path/to/ffmpeg-dev`.
 
+Or build and run it in a real Linux container (this is what actually
+produced the "on real Linux" findings below):
+
+```sh
+docker build -t rtp-streaming-linux .
+docker run --rm -it --cap-add=NET_ADMIN --cap-add=NET_RAW rtp-streaming-linux bash
+```
+`NET_ADMIN`/`NET_RAW` are only needed for `tc`/`tcpdump` inside the
+container — plain `docker run --rm -it rtp-streaming-linux bash` is
+enough for building/running the pipeline itself.
+
 ## Run the demo (loopback)
 
 ```sh
@@ -76,22 +87,65 @@ Zero loss and ~330 kbps line up with libx264's own reported encode
 bitrate (322–330 kb/s) for this clip — the stats service's independent,
 header-level measurement agrees with the encoder's own accounting.
 
-**The relay → receiver hop was a different story on this machine**: the
-receiver only decoded 123 of 148 frames before libavformat's RTP demuxer
-gave up after an observed ~10.8s stall waiting on a gap in the sequence
-it never received. `statsservice` shows the *first* hop delivering every
-packet, so the loss happened strictly between the relay and the decoder
-— most likely a socket-level drop on this Windows dev box rather than
-anything in the RTP/H.264 logic itself. That asymmetry — "the wire
-between A and B is measured clean, but B still doesn't get everything" —
-is exactly the kind of failure mode `tc netem` impairment testing (below)
-is meant to catch systematically instead of by accident.
+**The relay → receiver hop was a different story, and it reproduces
+identically on real Linux** (in the Docker container, not just Windows):
+the receiver only decoded 123 of 148 frames before `av_read_frame`
+silently stopped returning new packets, ~24s in. `statsservice` shows the
+sender→relay hop delivering every packet — on Linux, jitter over that
+hop measured **0.7ms** (vs. ~6.5ms on Windows/MinGW — real-time scheduling
+is just more consistent under Linux), still 0% loss, still ~330 kbps.
+So the loss is strictly between the relay and the decoder, on both
+platforms. That ruled out "Windows quirk" as the explanation, so it got
+investigated properly instead of just re-documented:
+
+- **`tcpdump -i lo udp port 6002`** during a run captured 205 of the
+  ~210 packets `statsservice` relayed (the few missing are capture
+  start/stop timing, not loss) — the packets *physically arrive* at the
+  receiver's socket. This rules out network- or OS-buffer-level loss
+  entirely.
+- **`av_log_set_level(AV_LOG_DEBUG)`** on the receiver shows completely
+  normal H.264 NAL parsing (SPS/PPS/non-IDR slices) right up to the exact
+  line before the process exits — no jitter-buffer warning, no
+  "misordered"/"lost"/timeout message anywhere in the log. FFmpeg's own
+  RTP demuxer isn't reporting a problem; it just stops.
+- **Tested and ruled out**: hypothesized the stall was tied to periodic
+  keyframes (GOP boundaries land right around where it stops) and tried
+  removing them (`gop_size` large enough for a single keyframe at frame
+  0). That made it *worse* — 0 of 148 frames decoded, because a
+  late-joining receiver that misses the one keyframe's slice data has
+  nothing to fall back on. Periodic keyframes are load-bearing for this
+  design, not the cause.
+
+**Current best hypothesis, still open**: something in libavformat's
+generic multi-media read loop (used even for a bare `sdp` file input)
+gives up — silently, with no logged reason — after a certain point,
+despite the RTP layer itself raising no complaint and the data being
+available at the socket. Next step would be instrumenting/tracing inside
+`libavformat/rtsp.c`'s read loop directly (the generic layer a bare-SDP
+open goes through), which wasn't done in this session.
 
 ## Network impairment testing (Linux, `tc netem`)
 
-This wasn't run in this dev environment (Windows, no `tc`), but is how
-it's meant to be exercised on Linux, where the sender/receiver/stats
-service all run unmodified:
+This was actually attempted on real Linux, in the Docker container above,
+with `NET_ADMIN` — and hit a different, more fundamental wall:
+
+```
+$ tc qdisc add dev lo root netem delay 40ms 10ms loss 5%
+Error: Specified qdisc kind is unknown.
+$ modprobe sch_netem
+modprobe: FATAL: Module sch_netem not found in directory /lib/modules/5.15.167.4-microsoft-standard-WSL2
+$ ls /lib/modules/
+ls: cannot access '/lib/modules/': No such file or directory
+```
+
+Docker Desktop's Linux VM (a trimmed WSL2 kernel) ships **no loadable
+kernel modules at all** — `sch_netem` can't be loaded no matter what
+capabilities the container has, because the module doesn't exist on the
+host kernel. This is a real, verified constraint of Docker Desktop on
+Windows specifically, distinct from the frame-loss issue above — not
+something `--cap-add` or an apt package can route around. It would work
+unmodified on a real Linux machine or a proper Linux VM (not Docker
+Desktop's bundled one):
 
 ```sh
 # Inject 50ms +/-10ms jitter and 2% loss on the interface the RTP
@@ -105,9 +159,9 @@ sudo tc qdisc del dev eth0 root netem
 
 Compare `statsservice`'s reported `jitter_ms`/`loss_percent` against the
 injected values to sanity-check the measurement code itself, then vary
-the `netem` parameters to characterize how the receiver's decode
-success rate degrades — the same "clean hop but lossy decode" gap found
-above is worth specifically checking for.
+the `netem` parameters to characterize how the receiver's decode success
+rate degrades — the open issue above is worth specifically checking
+against real, controlled loss instead of the unexplained kind.
 
 ## Wireshark inspection
 
